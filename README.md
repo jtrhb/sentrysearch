@@ -8,28 +8,53 @@ Semantic search over dashcam footage. Type what you're looking for, get a trimme
 
 sentrysearch splits your dashcam videos into overlapping chunks, embeds each chunk directly as video using Google's Gemini Embedding model, and stores the vectors in a local ChromaDB database. When you search, your text query is embedded into the same vector space and matched against the stored video embeddings. The top match is automatically trimmed from the original file and saved as a clip.
 
-## Installation
+## Getting Started
+
+1. Clone and install:
 
 ```bash
+git clone https://github.com/ssrajadh/sentrysearch.git
+cd sentrysearch
+python -m venv venv && source venv/bin/activate
 pip install -e .
+```
+
+2. Set up your API key:
+
+```bash
+sentrysearch init
+```
+
+This prompts for your Gemini API key, writes it to `.env`, and validates it with a test embedding.
+
+3. Index your footage:
+
+```bash
+sentrysearch index /path/to/dashcam/footage
+```
+
+4. Search:
+
+```bash
+sentrysearch search "red truck running a stop sign"
 ```
 
 ffmpeg is required for video chunking and trimming. If you don't have it system-wide, the bundled `imageio-ffmpeg` is used automatically.
 
-Set up your Gemini API key:
-
-```bash
-cp .env.example .env
-# Edit .env and add your key from https://aistudio.google.com/apikey
-```
-
-Or export it directly:
-
-```bash
-export GEMINI_API_KEY=your-key-here
-```
+> **Manual setup:** If you prefer not to use `sentrysearch init`, you can copy `.env.example` to `.env` and add your key from [aistudio.google.com/apikey](https://aistudio.google.com/apikey) manually.
 
 ## Usage
+
+### Init
+
+```bash
+$ sentrysearch init
+Enter your Gemini API key (get one at https://aistudio.google.com/apikey): ****
+Validating API key...
+Setup complete. You're ready to go — run `sentrysearch index <directory>` to get started.
+```
+
+If a key is already configured, you'll be asked whether to overwrite it.
 
 ### Index footage
 
@@ -74,11 +99,17 @@ Gemini Embedding 2 can natively embed video — raw video pixels are projected i
 
 ## Cost
 
-Indexing 1 hour of footage costs ~$0.25 with Gemini's embedding API. Search queries are negligible (text embedding only).
+Indexing 1 hour of footage costs ~$2.50 with Gemini's embedding API. This is with default settings (30s chunks, 5s overlap). Costs can be reduced by increasing chunk duration or decreasing overlap. Search queries are negligible (text embedding only).
+
+## Limitations & Future Work
+
+- **Indexing cost can be optimized** — currently every chunk is embedded regardless of content. Skipping still frames, reducing frame rate before embedding, or using smarter chunking (scene detection) could significantly reduce API calls and cost.
+- **Search quality depends on chunk boundaries** — if an event spans two chunks, the overlapping window helps but isn't perfect.
+- **Gemini Embedding 2 is in preview** — API behavior and pricing may change.
 
 ## Compatibility
 
-This works with any dashcam footage in mp4 format, not just Tesla Sentry Mode. The directory scanner recursively finds all `.mp4` files regardless of folder structure.
+This works with any footage in mp4 format, not just Tesla Sentry Mode. The directory scanner recursively finds all `.mp4` files regardless of folder structure.
 
 ## Requirements
 

@@ -64,6 +64,74 @@ def cli():
 
 
 # -----------------------------------------------------------------------
+# init
+# -----------------------------------------------------------------------
+
+@cli.command()
+def init():
+    """Set up your Gemini API key for sentrysearch."""
+    env_path = os.path.join(os.getcwd(), ".env")
+
+    # Check for existing key
+    if os.path.exists(env_path):
+        with open(env_path) as f:
+            contents = f.read()
+        if "GEMINI_API_KEY=" in contents:
+            if not click.confirm("API key already configured. Overwrite?", default=False):
+                return
+
+    api_key = click.prompt(
+        "Enter your Gemini API key (get one at https://aistudio.google.com/apikey)"
+    )
+
+    # Write/update .env
+    if os.path.exists(env_path):
+        with open(env_path) as f:
+            lines = f.readlines()
+        with open(env_path, "w") as f:
+            found = False
+            for line in lines:
+                if line.startswith("GEMINI_API_KEY="):
+                    f.write(f"GEMINI_API_KEY={api_key}\n")
+                    found = True
+                else:
+                    f.write(line)
+            if not found:
+                f.write(f"GEMINI_API_KEY={api_key}\n")
+    else:
+        with open(env_path, "w") as f:
+            f.write(f"GEMINI_API_KEY={api_key}\n")
+
+    # Validate by embedding a test string
+    os.environ["GEMINI_API_KEY"] = api_key
+    click.echo("Validating API key...")
+    try:
+        from .embedder import embed_query
+
+        vec = embed_query("test")
+        if len(vec) != 768:
+            click.secho(
+                f"Unexpected embedding dimension: {len(vec)} (expected 768). "
+                "The key may be valid but something is off.",
+                fg="yellow",
+                err=True,
+            )
+            raise SystemExit(1)
+    except SystemExit:
+        raise
+    except Exception as e:
+        click.secho(f"Validation failed: {e}", fg="red", err=True)
+        click.secho("Please check your API key and try again.", fg="red", err=True)
+        raise SystemExit(1)
+
+    click.secho(
+        "Setup complete. You're ready to go — run "
+        "`sentrysearch index <directory>` to get started.",
+        fg="green",
+    )
+
+
+# -----------------------------------------------------------------------
 # index
 # -----------------------------------------------------------------------
 
