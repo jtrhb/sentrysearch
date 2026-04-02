@@ -1,73 +1,15 @@
-"""ChromaDB vector store."""
+"""PostgreSQL + pgvector vector store."""
 
 import hashlib
+import os
 from datetime import datetime, timezone
-from pathlib import Path
 
-import chromadb
-
-
-DEFAULT_DB_PATH = Path.home() / ".sentrysearch" / "db"
+import psycopg
+from pgvector.psycopg import register_vector
 
 
 class BackendMismatchError(RuntimeError):
-    """Raised when search backend/model doesn't match the indexed backend/model."""
-
-
-def _collection_name(backend: str, model: str | None = None) -> str:
-    """Return ChromaDB collection name for a backend and optional model."""
-    if backend == "gemini":
-        return "dashcam_chunks"
-    if model:
-        return f"dashcam_chunks_local_{model}"
-    # Legacy: local backend without model distinction
-    return "dashcam_chunks_local"
-
-
-def detect_index(db_path: str | Path | None = None) -> tuple[str | None, str | None]:
-    """Return ``(backend, model)`` for the first index with data.
-
-    Returns ``(None, None)`` when no index contains data.
-    Checks gemini first, then model-specific local collections, then the
-    legacy ``dashcam_chunks_local`` collection (treated as qwen8b).
-    """
-    db_path = str(db_path or DEFAULT_DB_PATH)
-    if not Path(db_path).exists():
-        return None, None
-    client = chromadb.PersistentClient(path=db_path)
-    existing = {c.name for c in client.list_collections()}
-
-    # Gemini first (default / legacy)
-    if "dashcam_chunks" in existing:
-        col = client.get_collection("dashcam_chunks")
-        if col.count() > 0:
-            return "gemini", None
-
-    # Model-specific local collections (dashcam_chunks_local_<model>)
-    for name in sorted(existing):
-        if name.startswith("dashcam_chunks_local_"):
-            col = client.get_collection(name)
-            if col.count() > 0:
-                meta = col.metadata or {}
-                model = meta.get("embedding_model")
-                if model is None:
-                    model = name.removeprefix("dashcam_chunks_local_")
-                return "local", model
-
-    # Legacy local collection (no model suffix) — treat as qwen8b
-    if "dashcam_chunks_local" in existing:
-        col = client.get_collection("dashcam_chunks_local")
-        if col.count() > 0:
-            meta = col.metadata or {}
-            return "local", meta.get("embedding_model", "qwen8b")
-
-    return None, None
-
-
-def detect_backend(db_path: str | Path | None = None) -> str | None:
-    """Return the backend that has indexed data, or None if empty."""
-    backend, _ = detect_index(db_path)
-    return backend
+    """Raised on backend mismatch (kept for backward compatibility)."""
 
 
 def _make_chunk_id(source_file: str, start_time: float) -> str:
@@ -76,48 +18,84 @@ def _make_chunk_id(source_file: str, start_time: float) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
-class SentryStore:
-    """Persistent vector store backed by ChromaDB."""
+def detect_index(database_url: str | None = None) -> tuple[str | None, str | None]:
+    """Return ('gemini', None) if indexed data exists, else (None, None)."""
+    try:
+        url = database_url or os.environ.get("DATABASE_URL", "")
+        if not url:
+            return None, None
+        with psycopg.connect(url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT EXISTS("
+                    "  SELECT 1 FROM information_schema.tables"
+                    "  WHERE table_name = 'chunks'"
+                    ")"
+                )
+                if not cur.fetchone()[0]:
+                    return None, None
+                cur.execute("SELECT EXISTS(SELECT 1 FROM chunks LIMIT 1)")
+                return ("gemini", None) if cur.fetchone()[0] else (None, None)
+    except Exception:
+        return None, None
 
-    def __init__(self, db_path: str | Path | None = None, backend: str = "gemini",
-                 model: str | None = None):
-        db_path = str(db_path or DEFAULT_DB_PATH)
-        Path(db_path).mkdir(parents=True, exist_ok=True)
-        self._client = chromadb.PersistentClient(path=db_path)
-        self._backend = backend
-        self._model = model
-        # Separate collection per backend+model so incompatible vectors never mix.
-        col_name = _collection_name(backend, model)
-        metadata = {"hnsw:space": "cosine", "embedding_backend": backend}
-        if model:
-            metadata["embedding_model"] = model
-        self._collection = self._client.get_or_create_collection(
-            name=col_name,
-            metadata=metadata,
-        )
+
+def detect_backend(database_url: str | None = None) -> str | None:
+    """Return the backend that has indexed data, or None."""
+    backend, _ = detect_index(database_url)
+    return backend
+
+
+class SentryStore:
+    """Persistent vector store backed by PostgreSQL + pgvector."""
+
+    def __init__(self, database_url: str | None = None, **kwargs):
+        """Initialize store.
+
+        Args:
+            database_url: PostgreSQL connection string. Falls back to
+                          DATABASE_URL environment variable.
+            **kwargs: Ignored (accepts legacy backend/model/db_path params).
+        """
+        self._url = database_url or os.environ["DATABASE_URL"]
+        self._conn = psycopg.connect(self._url)
+        register_vector(self._conn)
+        self._ensure_schema()
+
+    def _ensure_schema(self):
+        with self._conn.cursor() as cur:
+            cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS chunks (
+                    id TEXT PRIMARY KEY,
+                    embedding vector(768) NOT NULL,
+                    source_file TEXT NOT NULL,
+                    start_time DOUBLE PRECISION NOT NULL,
+                    end_time DOUBLE PRECISION NOT NULL,
+                    indexed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS chunks_source_file_idx
+                ON chunks (source_file)
+            """)
+        self._conn.commit()
 
     @property
-    def collection(self) -> chromadb.Collection:
-        return self._collection
+    def collection(self):
+        """Not applicable for pgvector — exists for interface compatibility."""
+        return None
 
     def get_backend(self) -> str:
-        """Return the backend this index was built with."""
-        meta = self._collection.metadata or {}
-        return meta.get("embedding_backend", "gemini")
+        return "gemini"
 
     def get_model(self) -> str | None:
-        """Return the model this index was built with, or None."""
-        meta = self._collection.metadata or {}
-        return meta.get("embedding_model")
+        return None
 
     def check_backend(self, backend: str) -> None:
-        """Raise BackendMismatchError if *backend* doesn't match the index."""
-        indexed_backend = self.get_backend()
-        if indexed_backend != backend:
+        if backend != "gemini":
             raise BackendMismatchError(
-                f"This index was built with the {indexed_backend} backend. "
-                f"Search with --backend {indexed_backend} or re-index with "
-                f"--backend {backend}."
+                f"Only gemini backend is supported, got: {backend}"
             )
 
     # ------------------------------------------------------------------
@@ -130,51 +108,47 @@ class SentryStore:
         embedding: list[float],
         metadata: dict,
     ) -> None:
-        """Store a single chunk embedding with metadata.
-
-        Required metadata keys: source_file, start_time, end_time.
-        An indexed_at ISO timestamp is added automatically.
-        """
-        meta = {
-            "source_file": metadata["source_file"],
-            "start_time": float(metadata["start_time"]),
-            "end_time": float(metadata["end_time"]),
-            "indexed_at": datetime.now(timezone.utc).isoformat(),
-        }
-        # Carry over any extra metadata the caller provides
-        for key in metadata:
-            if key not in meta and key != "embedding":
-                meta[key] = metadata[key]
-
-        self._collection.upsert(
-            ids=[chunk_id],
-            embeddings=[embedding],
-            metadatas=[meta],
-        )
+        """Store a single chunk embedding with metadata."""
+        now = datetime.now(timezone.utc)
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO chunks (id, embedding, source_file, start_time, end_time, indexed_at)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE SET
+                    embedding = EXCLUDED.embedding,
+                    source_file = EXCLUDED.source_file,
+                    start_time = EXCLUDED.start_time,
+                    end_time = EXCLUDED.end_time,
+                    indexed_at = EXCLUDED.indexed_at
+                """,
+                (
+                    chunk_id, embedding, metadata["source_file"],
+                    float(metadata["start_time"]), float(metadata["end_time"]), now,
+                ),
+            )
+        self._conn.commit()
 
     def add_chunks(self, chunks: list[dict]) -> None:
         """Batch-store chunks. Each dict must have 'embedding' and metadata keys."""
-        now = datetime.now(timezone.utc).isoformat()
-        ids = []
-        embeddings = []
-        metadatas = []
-
-        for chunk in chunks:
-            chunk_id = _make_chunk_id(chunk["source_file"], chunk["start_time"])
-            ids.append(chunk_id)
-            embeddings.append(chunk["embedding"])
-            metadatas.append({
-                "source_file": chunk["source_file"],
-                "start_time": float(chunk["start_time"]),
-                "end_time": float(chunk["end_time"]),
-                "indexed_at": now,
-            })
-
-        self._collection.upsert(
-            ids=ids,
-            embeddings=embeddings,
-            metadatas=metadatas,
-        )
+        now = datetime.now(timezone.utc)
+        with self._conn.cursor() as cur:
+            for chunk in chunks:
+                chunk_id = _make_chunk_id(chunk["source_file"], chunk["start_time"])
+                cur.execute(
+                    """
+                    INSERT INTO chunks (id, embedding, source_file, start_time, end_time, indexed_at)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (id) DO UPDATE SET
+                        embedding = EXCLUDED.embedding,
+                        indexed_at = EXCLUDED.indexed_at
+                    """,
+                    (
+                        chunk_id, chunk["embedding"], chunk["source_file"],
+                        float(chunk["start_time"]), float(chunk["end_time"]), now,
+                    ),
+                )
+        self._conn.commit()
 
     # ------------------------------------------------------------------
     # Read
@@ -185,56 +159,78 @@ class SentryStore:
         query_embedding: list[float],
         n_results: int = 5,
     ) -> list[dict]:
-        """Return top N results with distances and metadata."""
-        count = self._collection.count()
-        if count == 0:
-            return []
+        """Return top N results ranked by cosine similarity."""
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM chunks")
+            if cur.fetchone()[0] == 0:
+                return []
 
-        results = self._collection.query(
-            query_embeddings=[query_embedding],
-            n_results=min(n_results, count),
-        )
+            cur.execute(
+                """
+                SELECT source_file, start_time, end_time,
+                       1 - distance AS score, distance
+                FROM (
+                    SELECT source_file, start_time, end_time,
+                           embedding <=> %s AS distance
+                    FROM chunks
+                    ORDER BY distance
+                    LIMIT %s
+                ) ranked
+                """,
+                (query_embedding, n_results),
+            )
+            rows = cur.fetchall()
 
-        hits = []
-        for i in range(len(results["ids"][0])):
-            meta = results["metadatas"][0][i]
-            distance = results["distances"][0][i]
-            hits.append({
-                "source_file": meta["source_file"],
-                "start_time": meta["start_time"],
-                "end_time": meta["end_time"],
-                "score": 1.0 - distance,  # cosine distance → similarity
-                "distance": distance,
-            })
-        return hits
+        return [
+            {
+                "source_file": row[0],
+                "start_time": row[1],
+                "end_time": row[2],
+                "score": float(row[3]),
+                "distance": float(row[4]),
+            }
+            for row in rows
+        ]
 
     def is_indexed(self, source_file: str) -> bool:
         """Check whether any chunks from source_file are already stored."""
-        results = self._collection.get(
-            where={"source_file": source_file},
-            limit=1,
-        )
-        return len(results["ids"]) > 0
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT EXISTS(SELECT 1 FROM chunks WHERE source_file = %s)",
+                (source_file,),
+            )
+            return cur.fetchone()[0]
 
     def remove_file(self, source_file: str) -> int:
         """Remove all chunks for a given source file. Returns count removed."""
-        results = self._collection.get(where={"source_file": source_file})
-        ids = results["ids"]
-        if ids:
-            self._collection.delete(ids=ids)
-        return len(ids)
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM chunks WHERE source_file = %s", (source_file,),
+            )
+            count = cur.rowcount
+        self._conn.commit()
+        return count
 
     def get_stats(self) -> dict:
         """Return store statistics."""
-        total = self._collection.count()
-        if total == 0:
-            return {"total_chunks": 0, "unique_source_files": 0, "source_files": []}
+        with self._conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM chunks")
+            total = cur.fetchone()[0]
 
-        # Fetch all metadata (only the fields we need)
-        all_meta = self._collection.get(include=["metadatas"])
-        source_files = sorted({m["source_file"] for m in all_meta["metadatas"]})
+            if total == 0:
+                return {"total_chunks": 0, "unique_source_files": 0, "source_files": []}
+
+            cur.execute(
+                "SELECT DISTINCT source_file FROM chunks ORDER BY source_file"
+            )
+            source_files = [row[0] for row in cur.fetchall()]
+
         return {
             "total_chunks": total,
             "unique_source_files": len(source_files),
             "source_files": source_files,
         }
+
+    def close(self):
+        """Close the database connection."""
+        self._conn.close()

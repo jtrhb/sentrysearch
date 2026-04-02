@@ -1,6 +1,7 @@
 """Shared test fixtures."""
 
 import math
+import os
 import subprocess
 
 import pytest
@@ -9,6 +10,7 @@ import pytest
 # ---------------------------------------------------------------------------
 # Embedder isolation: reset module-level singletons between tests
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture(autouse=True)
 def _reset_embedder_globals():
@@ -33,6 +35,7 @@ def _reset_ffmpeg_cache():
 # ---------------------------------------------------------------------------
 # Mock embedder fixture (returns deterministic 768-dim vectors)
 # ---------------------------------------------------------------------------
+
 
 def _fake_embedding(dim: int = 768) -> list[float]:
     """Return a deterministic unit-normalized embedding vector."""
@@ -60,20 +63,36 @@ def mock_embed_video_chunk(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Temporary ChromaDB store
+# Temporary PostgreSQL store (requires DATABASE_URL)
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
-def tmp_store(tmp_path):
-    """Create a SentryStore backed by a temporary directory."""
+def tmp_store():
+    """Create a SentryStore backed by the test database.
+
+    Requires DATABASE_URL env var. Skips tests if not set.
+    """
+    url = os.environ.get("DATABASE_URL")
+    if not url:
+        pytest.skip("DATABASE_URL not set — skipping store tests")
+
     from sentrysearch.store import SentryStore
 
-    return SentryStore(db_path=tmp_path / "test_db")
+    store = SentryStore(database_url=url)
+    yield store
+
+    # Clean up test data
+    with store._conn.cursor() as cur:
+        cur.execute("DELETE FROM chunks")
+    store._conn.commit()
+    store.close()
 
 
 # ---------------------------------------------------------------------------
 # Tiny synthetic test video (generated via ffmpeg from imageio-ffmpeg)
 # ---------------------------------------------------------------------------
+
 
 @pytest.fixture(scope="session")
 def ffmpeg_exe():
@@ -90,11 +109,16 @@ def tiny_video(ffmpeg_exe, tmp_path_factory):
     video_path = video_dir / "test_3s.mp4"
     subprocess.run(
         [
-            ffmpeg_exe, "-y",
-            "-f", "lavfi",
-            "-i", "testsrc2=size=64x64:rate=10:duration=3",
-            "-c:v", "libx264",
-            "-pix_fmt", "yuv420p",
+            ffmpeg_exe,
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=64x64:rate=10:duration=3",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
             str(video_path),
         ],
         capture_output=True,
@@ -111,11 +135,16 @@ def longer_video(ffmpeg_exe, tmp_path_factory):
     video_path = video_dir / "test_10s.mp4"
     subprocess.run(
         [
-            ffmpeg_exe, "-y",
-            "-f", "lavfi",
-            "-i", "testsrc2=size=64x64:rate=10:duration=10",
-            "-c:v", "libx264",
-            "-pix_fmt", "yuv420p",
+            ffmpeg_exe,
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=64x64:rate=10:duration=10",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
             str(video_path),
         ],
         capture_output=True,
