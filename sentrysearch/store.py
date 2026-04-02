@@ -68,7 +68,7 @@ class SentryStore:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS chunks (
                     id TEXT PRIMARY KEY,
-                    embedding vector(768) NOT NULL,
+                    embedding vector(3072) NOT NULL,
                     source_file TEXT NOT NULL,
                     start_time DOUBLE PRECISION NOT NULL,
                     end_time DOUBLE PRECISION NOT NULL,
@@ -78,6 +78,31 @@ class SentryStore:
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS chunks_source_file_idx
                 ON chunks (source_file)
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS video_critiques (
+                    source_file TEXT PRIMARY KEY,
+                    issues JSONB NOT NULL DEFAULT '[]',
+                    category_scores JSONB NOT NULL DEFAULT '{}',
+                    severity_counts JSONB NOT NULL DEFAULT '{}',
+                    quality_grade TEXT,
+                    grade_score DOUBLE PRECISION,
+                    summary TEXT,
+                    critiqued_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS video_scores (
+                    source_file TEXT PRIMARY KEY,
+                    character_consistency DOUBLE PRECISION,
+                    scene_consistency DOUBLE PRECISION,
+                    ai_score DOUBLE PRECISION,
+                    max_similarity DOUBLE PRECISION,
+                    similar_to TEXT,
+                    overall_score DOUBLE PRECISION,
+                    details JSONB NOT NULL DEFAULT '{}',
+                    scored_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
             """)
         self._conn.commit()
 
@@ -230,6 +255,230 @@ class SentryStore:
             "unique_source_files": len(source_files),
             "source_files": source_files,
         }
+
+    # ------------------------------------------------------------------
+    # Video critiques
+    # ------------------------------------------------------------------
+
+    def save_critique(self, source_file: str, critique: dict) -> None:
+        """Save or update a video critique."""
+        import json
+
+        now = datetime.now(timezone.utc)
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO video_critiques
+                    (source_file, issues, category_scores, severity_counts,
+                     quality_grade, grade_score, summary, critiqued_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (source_file) DO UPDATE SET
+                    issues = EXCLUDED.issues,
+                    category_scores = EXCLUDED.category_scores,
+                    severity_counts = EXCLUDED.severity_counts,
+                    quality_grade = EXCLUDED.quality_grade,
+                    grade_score = EXCLUDED.grade_score,
+                    summary = EXCLUDED.summary,
+                    critiqued_at = EXCLUDED.critiqued_at
+                """,
+                (
+                    source_file,
+                    json.dumps(critique.get("issues", [])),
+                    json.dumps(critique.get("category_scores", {})),
+                    json.dumps(critique.get("severity_counts", {})),
+                    critique.get("quality_grade"),
+                    critique.get("grade_score"),
+                    critique.get("summary"),
+                    now,
+                ),
+            )
+        self._conn.commit()
+
+    def get_critique(self, source_file: str) -> dict | None:
+        """Get critique for a specific video."""
+        import json
+
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """SELECT issues, category_scores, severity_counts,
+                          quality_grade, grade_score, summary
+                   FROM video_critiques WHERE source_file = %s""",
+                (source_file,),
+            )
+            row = cur.fetchone()
+        if row is None:
+            return None
+
+        def _parse(val):
+            return json.loads(val) if isinstance(val, str) else val
+
+        return {
+            "source_file": source_file,
+            "issues": _parse(row[0]),
+            "category_scores": _parse(row[1]),
+            "severity_counts": _parse(row[2]),
+            "quality_grade": row[3],
+            "grade_score": row[4],
+            "summary": row[5],
+        }
+
+    def get_critiques(
+        self,
+        max_grade: str | None = None,
+        min_issues: int | None = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        """Query video critiques with optional filters."""
+        import json
+
+        grade_order = {"F": 0, "D": 1, "C": 2, "B": 3, "A": 4}
+        conditions = []
+        params = []
+
+        if max_grade is not None:
+            conditions.append("grade_score <= %s")
+            # Map grade letter to score threshold
+            thresholds = {"A": 100, "B": 89, "C": 74, "D": 59, "F": 39}
+            params.append(thresholds.get(max_grade.upper(), 100))
+
+        params.append(limit)
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+        with self._conn.cursor() as cur:
+            cur.execute(
+                f"""SELECT source_file, issues, category_scores,
+                           severity_counts, quality_grade, grade_score, summary
+                    FROM video_critiques {where}
+                    ORDER BY grade_score ASC
+                    LIMIT %s""",
+                params,
+            )
+            rows = cur.fetchall()
+
+        def _parse(val):
+            return json.loads(val) if isinstance(val, str) else val
+
+        results = []
+        for row in rows:
+            entry = {
+                "source_file": row[0],
+                "issues": _parse(row[1]),
+                "category_scores": _parse(row[2]),
+                "severity_counts": _parse(row[3]),
+                "quality_grade": row[4],
+                "grade_score": row[5],
+                "summary": row[6],
+            }
+            if min_issues is not None:
+                if len(entry["issues"]) < min_issues:
+                    continue
+            results.append(entry)
+        return results
+
+    # ------------------------------------------------------------------
+    # Video scores
+    # ------------------------------------------------------------------
+
+    def save_score(self, source_file: str, scores: dict) -> None:
+        """Save or update video scores."""
+        import json
+
+        now = datetime.now(timezone.utc)
+        consistency = scores.get("consistency", {})
+        ai = scores.get("ai_detection", {})
+        similarity = scores.get("similarity", {})
+
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO video_scores
+                    (source_file, character_consistency, scene_consistency,
+                     ai_score, max_similarity, similar_to, overall_score,
+                     details, scored_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (source_file) DO UPDATE SET
+                    character_consistency = EXCLUDED.character_consistency,
+                    scene_consistency = EXCLUDED.scene_consistency,
+                    ai_score = EXCLUDED.ai_score,
+                    max_similarity = EXCLUDED.max_similarity,
+                    similar_to = EXCLUDED.similar_to,
+                    overall_score = EXCLUDED.overall_score,
+                    details = EXCLUDED.details,
+                    scored_at = EXCLUDED.scored_at
+                """,
+                (
+                    source_file,
+                    consistency.get("character"),
+                    consistency.get("scene"),
+                    ai.get("score"),
+                    similarity.get("max_similarity"),
+                    similarity.get("similar_to"),
+                    scores.get("overall_score"),
+                    json.dumps(scores),
+                    now,
+                ),
+            )
+        self._conn.commit()
+
+    def get_score(self, source_file: str) -> dict | None:
+        """Get scores for a specific video."""
+        import json
+
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "SELECT details FROM video_scores WHERE source_file = %s",
+                (source_file,),
+            )
+            row = cur.fetchone()
+        if row is None:
+            return None
+        details = row[0]
+        if isinstance(details, str):
+            details = json.loads(details)
+        details["source_file"] = source_file
+        return details
+
+    def get_scores(
+        self,
+        min_overall: float | None = None,
+        max_ai_score: float | None = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        """Query video scores with optional filters."""
+        import json
+
+        conditions = []
+        params = []
+
+        if min_overall is not None:
+            conditions.append("overall_score >= %s")
+            params.append(min_overall)
+        if max_ai_score is not None:
+            conditions.append("ai_score <= %s")
+            params.append(max_ai_score)
+
+        where = ""
+        if conditions:
+            where = "WHERE " + " AND ".join(conditions)
+
+        params.append(limit)
+
+        with self._conn.cursor() as cur:
+            cur.execute(
+                f"SELECT source_file, details FROM video_scores "
+                f"{where} ORDER BY overall_score DESC LIMIT %s",
+                params,
+            )
+            rows = cur.fetchall()
+
+        results = []
+        for row in rows:
+            details = row[1]
+            if isinstance(details, str):
+                details = json.loads(details)
+            details["source_file"] = row[0]
+            results.append(details)
+        return results
 
     def close(self):
         """Close the database connection."""

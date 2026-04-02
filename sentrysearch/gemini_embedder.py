@@ -15,7 +15,7 @@ from .base_embedder import BaseEmbedder
 load_dotenv()
 
 EMBED_MODEL = "gemini-embedding-2-preview"
-DIMENSIONS = 768
+DIMENSIONS = 3072
 DEFAULT_RPM = 55
 
 # ---------------------------------------------------------------------------

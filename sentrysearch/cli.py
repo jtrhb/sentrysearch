@@ -10,6 +10,9 @@ from dotenv import load_dotenv
 
 _ENV_PATH = os.path.join(os.path.expanduser("~"), ".sentrysearch", ".env")
 
+# Maximum video duration (seconds) Gemini Embedding 2 accepts in a single request.
+MAX_SINGLE_EMBED_DURATION = 120
+
 # Load from stable config location first, then cwd as fallback
 load_dotenv(_ENV_PATH)
 load_dotenv()  # cwd .env can override
@@ -36,13 +39,7 @@ def _open_file(path: str) -> None:
                 stderr=subprocess.DEVNULL,
             )
     except Exception:
-        pass  # non-critical — clip is already saved
-
-
-def _overlay_output_path(path: str) -> str:
-    """Return the default overlay output path for a source video."""
-    base, _ext = os.path.splitext(path)
-    return f"{base}_overlay.mp4"
+        pass
 
 
 def _handle_error(e: Exception) -> None:
@@ -75,63 +72,9 @@ def _handle_error(e: Exception) -> None:
     raise e
 
 
-def _apply_overlay_to_clip(
-    clip_path: str,
-    source_file: str,
-    start_time: float,
-    end_time: float,
-    *,
-    replace: bool = True,
-) -> bool:
-    """Apply Tesla telemetry overlay to a clip. Returns True on success."""
-    from .overlay import apply_overlay, get_metadata_samples, reverse_geocode
-
-    samples = get_metadata_samples(source_file, start_time, end_time)
-    if samples is None:
-        click.secho(
-            "No Tesla SEI metadata found — skipping overlay.",
-            fg="yellow",
-            err=True,
-        )
-        return False
-
-    location = None
-    mid = samples[len(samples) // 2]
-    lat = mid.get("latitude_deg", 0.0)
-    lon = mid.get("longitude_deg", 0.0)
-    if lat and lon:
-        click.echo("Reverse geocoding location...")
-        location = reverse_geocode(lat, lon)
-        if location is None:
-            click.secho(
-                "Geocoding failed — continuing without location. "
-                'Install deps with: uv tool install ".[tesla]"',
-                fg="yellow",
-                err=True,
-            )
-
-    overlay_path = _overlay_output_path(clip_path)
-    result_path = apply_overlay(
-        clip_path,
-        overlay_path,
-        samples,
-        location,
-        source_file=source_file,
-        start_time=start_time,
-    )
-    if result_path == overlay_path and os.path.isfile(overlay_path):
-        if replace:
-            os.replace(overlay_path, clip_path)
-        click.echo("Applied Tesla metadata overlay")
-        return True
-
-    click.secho("Overlay failed.", fg="yellow", err=True)
-    return False
-
-
 @click.group()
 def cli():
-    """Search dashcam footage using natural language queries."""
+    """Search video footage using natural language queries."""
 
 
 # -----------------------------------------------------------------------
@@ -145,7 +88,6 @@ def init():
     env_path = _ENV_PATH
     os.makedirs(os.path.dirname(env_path), exist_ok=True)
 
-    # Check for existing key
     if os.path.exists(env_path):
         with open(env_path) as f:
             contents = f.read()
@@ -162,7 +104,6 @@ def init():
         hide_input=True,
     )
 
-    # Write/update .env
     if os.path.exists(env_path):
         with open(env_path) as f:
             lines = f.readlines()
@@ -180,7 +121,6 @@ def init():
         with open(env_path, "w") as f:
             f.write(f"GEMINI_API_KEY={api_key}\n")
 
-    # Validate by embedding a test string
     os.environ["GEMINI_API_KEY"] = api_key
     click.echo("Validating API key...")
     try:
@@ -188,9 +128,9 @@ def init():
 
         embedder = get_embedder("gemini")
         vec = embedder.embed_query("test")
-        if len(vec) != 768:
+        if len(vec) != 3072:
             click.secho(
-                f"Unexpected embedding dimension: {len(vec)} (expected 768). "
+                f"Unexpected embedding dimension: {len(vec)} (expected 3072). "
                 "The key may be valid but something is off.",
                 fg="yellow",
                 err=True,
@@ -208,11 +148,6 @@ def init():
         "`sentrysearch index <directory>` to get started.",
         fg="green",
     )
-    click.secho(
-        "\nTip: Set a spending limit at https://aistudio.google.com/billing "
-        "to prevent accidental overspending.",
-        fg="yellow",
-    )
 
 
 # -----------------------------------------------------------------------
@@ -223,18 +158,6 @@ def init():
 @cli.command()
 @click.argument(
     "directory", type=click.Path(exists=True, file_okay=True, dir_okay=True)
-)
-@click.option(
-    "--chunk-duration",
-    default=30,
-    show_default=True,
-    help="Chunk duration in seconds.",
-)
-@click.option(
-    "--overlap",
-    default=5,
-    show_default=True,
-    help="Overlap between chunks in seconds.",
 )
 @click.option(
     "--preprocess/--no-preprocess",
@@ -255,25 +178,35 @@ def init():
     help="Target frames per second for preprocessing.",
 )
 @click.option(
-    "--skip-still/--no-skip-still",
-    default=True,
+    "--chunk-duration",
+    default=30,
     show_default=True,
-    help="Skip chunks with no meaningful visual change.",
+    help="Chunk duration in seconds (only for videos >120s).",
+)
+@click.option(
+    "--overlap",
+    default=5,
+    show_default=True,
+    help="Overlap between chunks in seconds (only for videos >120s).",
 )
 @click.option("--verbose", is_flag=True, help="Show debug info.")
 def index(
     directory,
-    chunk_duration,
-    overlap,
     preprocess,
     target_resolution,
     target_fps,
-    skip_still,
+    chunk_duration,
+    overlap,
     verbose,
 ):
-    """Index supported video files in DIRECTORY for searching."""
+    """Index supported video files in DIRECTORY for searching.
+
+    Videos ≤120s are embedded as a whole.  Longer videos are automatically
+    split into overlapping chunks.
+    """
     from .chunker import (
         SUPPORTED_VIDEO_EXTENSIONS,
+        _get_video_duration,
         chunk_video,
         is_still_frame_chunk,
         preprocess_chunk,
@@ -299,7 +232,6 @@ def index(
         total_files = len(videos)
         new_files = 0
         new_chunks = 0
-        skipped_chunks = 0
 
         for file_idx, video_path in enumerate(videos, 1):
             abs_path = os.path.abspath(video_path)
@@ -311,64 +243,113 @@ def index(
                 )
                 continue
 
-            chunks = chunk_video(
-                abs_path, chunk_duration=chunk_duration, overlap=overlap
-            )
-            num_chunks = len(chunks)
-            embedded = []
-            files_to_cleanup = []
+            duration = _get_video_duration(abs_path)
 
-            for chunk_idx, chunk in enumerate(chunks, 1):
-                if skip_still and is_still_frame_chunk(
-                    chunk["chunk_path"], verbose=verbose
-                ):
-                    click.echo(
-                        f"Skipping chunk {chunk_idx}/{num_chunks} (still frame)"
-                    )
-                    skipped_chunks += 1
-                    files_to_cleanup.append(chunk["chunk_path"])
-                    continue
-
+            if duration <= MAX_SINGLE_EMBED_DURATION:
+                # --- Whole-video embedding ---
                 click.echo(
                     f"Indexing file {file_idx}/{total_files}: {basename} "
-                    f"[chunk {chunk_idx}/{num_chunks}]"
+                    f"({duration:.0f}s, whole video)"
                 )
 
-                embed_path = chunk["chunk_path"]
+                embed_path = abs_path
                 if preprocess:
                     embed_path = preprocess_chunk(
-                        embed_path,
+                        abs_path,
                         target_resolution=target_resolution,
                         target_fps=target_fps,
                     )
-                    if embed_path != chunk["chunk_path"]:
-                        files_to_cleanup.append(embed_path)
+                    if verbose and embed_path != abs_path:
+                        orig = os.path.getsize(abs_path)
+                        new = os.path.getsize(embed_path)
+                        click.echo(
+                            f"  [verbose] preprocess: {orig / 1024:.0f}KB -> "
+                            f"{new / 1024:.0f}KB",
+                            err=True,
+                        )
 
                 embedding = embedder.embed_video_chunk(embed_path, verbose=verbose)
-                embedded.append({**chunk, "embedding": embedding})
-                files_to_cleanup.append(chunk["chunk_path"])
 
-            # Clean up temporary chunk files
-            for f in files_to_cleanup:
-                try:
-                    os.unlink(f)
-                except OSError:
-                    pass
-
-            if chunks:
-                tmp_dir = os.path.dirname(chunks[0]["chunk_path"])
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-
-            if embedded:
-                store.add_chunks(embedded)
+                store.add_chunks(
+                    [
+                        {
+                            "source_file": abs_path,
+                            "start_time": 0.0,
+                            "end_time": duration,
+                            "embedding": embedding,
+                        }
+                    ]
+                )
                 new_files += 1
-                new_chunks += len(embedded)
+                new_chunks += 1
+
+                if embed_path != abs_path:
+                    try:
+                        os.unlink(embed_path)
+                    except OSError:
+                        pass
+
+            else:
+                # --- Chunked embedding for long videos ---
+                chunks = chunk_video(
+                    abs_path, chunk_duration=chunk_duration, overlap=overlap
+                )
+                num_chunks = len(chunks)
+                embedded = []
+                files_to_cleanup = []
+
+                click.echo(
+                    f"Indexing file {file_idx}/{total_files}: {basename} "
+                    f"({duration:.0f}s, {num_chunks} chunks)"
+                )
+
+                for chunk_idx, chunk in enumerate(chunks, 1):
+                    if is_still_frame_chunk(
+                        chunk["chunk_path"], verbose=verbose
+                    ):
+                        click.echo(
+                            f"  Skipping chunk {chunk_idx}/{num_chunks} (still frame)"
+                        )
+                        files_to_cleanup.append(chunk["chunk_path"])
+                        continue
+
+                    click.echo(f"  Embedding chunk {chunk_idx}/{num_chunks}")
+
+                    embed_path = chunk["chunk_path"]
+                    if preprocess:
+                        embed_path = preprocess_chunk(
+                            embed_path,
+                            target_resolution=target_resolution,
+                            target_fps=target_fps,
+                        )
+                        if embed_path != chunk["chunk_path"]:
+                            files_to_cleanup.append(embed_path)
+
+                    embedding = embedder.embed_video_chunk(
+                        embed_path, verbose=verbose
+                    )
+                    embedded.append({**chunk, "embedding": embedding})
+                    files_to_cleanup.append(chunk["chunk_path"])
+
+                for f in files_to_cleanup:
+                    try:
+                        os.unlink(f)
+                    except OSError:
+                        pass
+
+                if chunks:
+                    tmp_dir = os.path.dirname(chunks[0]["chunk_path"])
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+
+                if embedded:
+                    store.add_chunks(embedded)
+                    new_files += 1
+                    new_chunks += len(embedded)
 
         stats = store.get_stats()
-        skipped_msg = f" (skipped {skipped_chunks} still)" if skipped_chunks else ""
         click.echo(
-            f"\nIndexed {new_chunks} new chunks from {new_files} files{skipped_msg}. "
-            f"Total: {stats['total_chunks']} chunks from "
+            f"\nIndexed {new_chunks} embeddings from {new_files} files. "
+            f"Total: {stats['total_chunks']} embeddings from "
             f"{stats['unique_source_files']} files."
         )
         store.close()
@@ -395,45 +376,18 @@ def index(
     help="Number of results to return.",
 )
 @click.option(
-    "-o",
-    "--output-dir",
-    default="~/sentrysearch_clips",
-    show_default=True,
-    help="Directory to save trimmed clips.",
-)
-@click.option(
-    "--trim/--no-trim",
-    default=True,
-    show_default=True,
-    help="Auto-trim the top result.",
-)
-@click.option(
-    "--save-top",
-    default=None,
-    type=click.IntRange(min=1),
-    help="Save the top N matching clips instead of just the #1 result.",
-)
-@click.option(
     "--threshold",
     default=0.41,
     show_default=True,
     type=float,
     help="Minimum similarity score to consider a confident match.",
 )
-@click.option(
-    "--overlay/--no-overlay",
-    default=False,
-    show_default=True,
-    help="Burn Tesla telemetry overlay onto trimmed clip.",
-)
 @click.option("--verbose", is_flag=True, help="Show debug info.")
-def search(query, n_results, output_dir, trim, save_top, threshold, overlay, verbose):
+def search(query, n_results, threshold, verbose):
     """Search indexed footage with a natural language QUERY."""
     from .embedder import get_embedder, reset_embedder
     from .search import search_footage
     from .store import SentryStore
-
-    output_dir = os.path.expanduser(output_dir)
 
     try:
         store = SentryStore()
@@ -448,10 +402,6 @@ def search(query, n_results, output_dir, trim, save_top, threshold, overlay, ver
 
         get_embedder("gemini")
 
-        # Ensure we fetch enough results for --save-top
-        if save_top is not None and save_top > n_results:
-            n_results = save_top
-
         results = search_footage(query, store, n_results=n_results, verbose=verbose)
 
         if not results:
@@ -460,9 +410,7 @@ def search(query, n_results, output_dir, trim, save_top, threshold, overlay, ver
             return
 
         best_score = results[0]["similarity_score"]
-        low_confidence = best_score < threshold
-
-        if low_confidence and not trim:
+        if best_score < threshold:
             click.secho(
                 f"(low confidence — best score: {best_score:.2f})",
                 fg="yellow",
@@ -479,36 +427,6 @@ def search(query, n_results, output_dir, trim, save_top, threshold, overlay, ver
             else:
                 click.echo(f"  #{i} [{score:.2f}] {basename} @ {start_str}-{end_str}")
 
-        should_trim = trim or save_top is not None
-        if should_trim:
-            if low_confidence:
-                if not click.confirm(
-                    f"No confident match found (best score: {best_score:.2f}). "
-                    "Show results anyway?",
-                    default=False,
-                ):
-                    store.close()
-                    return
-
-            from .trimmer import trim_top_results
-
-            count = save_top if save_top is not None else 1
-            clip_paths = trim_top_results(results, output_dir, count=count)
-
-            for i, clip_path in enumerate(clip_paths):
-                if overlay:
-                    r = results[i]
-                    _apply_overlay_to_clip(
-                        clip_path,
-                        r["source_file"],
-                        r["start_time"],
-                        r["end_time"],
-                    )
-                click.echo(f"\nSaved clip: {clip_path}")
-
-            if clip_paths:
-                _open_file(clip_paths[0])
-
         store.close()
 
     except Exception as e:
@@ -518,43 +436,229 @@ def search(query, n_results, output_dir, trim, save_top, threshold, overlay, ver
 
 
 # -----------------------------------------------------------------------
-# overlay
+# critique
 # -----------------------------------------------------------------------
 
 
 @cli.command()
-@click.argument("video", type=click.Path(exists=True, dir_okay=False))
-@click.option(
-    "-o", "--output", default=None, help="Output path (default: <video>_overlay.mp4)."
+@click.argument(
+    "path", type=click.Path(exists=True, file_okay=True, dir_okay=True)
 )
-def overlay(video, output):
-    """Apply Tesla telemetry overlay to a VIDEO file for testing."""
-    from .chunker import _get_video_duration
+@click.option("--verbose", is_flag=True, help="Show all issues including nitpicks.")
+def critique(path, verbose):
+    """Run comprehensive quality criticism on video files.
 
-    video = os.path.abspath(video)
-    if output is None:
-        output = _overlay_output_path(video)
+    Identifies specific defects: hand deformation, lip sync, clipping,
+    texture swimming, physics violations, and more.
+    """
+    from .chunker import SUPPORTED_VIDEO_EXTENSIONS, scan_directory
+    from .criticizer import VideoCritic
+    from .store import SentryStore, detect_index
 
     try:
-        duration = _get_video_duration(video)
+        critic = VideoCritic()
+
+        store = None
+        backend, _ = detect_index()
+        if backend is not None:
+            store = SentryStore()
+
+        if os.path.isfile(path):
+            videos = [os.path.abspath(path)]
+        else:
+            videos = scan_directory(path)
+
+        if not videos:
+            supported = ", ".join(SUPPORTED_VIDEO_EXTENSIONS)
+            click.echo(f"No supported video files found ({supported}).")
+            return
+
+        for i, video_path in enumerate(videos, 1):
+            basename = os.path.basename(video_path)
+            click.echo(f"\nCritiquing ({i}/{len(videos)}): {basename}")
+
+            result = critic.criticize(video_path)
+
+            # Grade and summary
+            grade = result["quality_grade"]
+            grade_score = result["grade_score"]
+            counts = result["severity_counts"]
+            color = (
+                "green" if grade in ("A", "B")
+                else "yellow" if grade == "C"
+                else "red"
+            )
+            click.secho(
+                f"  Grade: {grade} ({grade_score}/100)", fg=color, bold=True
+            )
+
+            # Severity counts
+            parts = []
+            if counts.get("critical", 0):
+                parts.append(click.style(f"{counts['critical']} critical", fg="red", bold=True))
+            if counts.get("major", 0):
+                parts.append(click.style(f"{counts['major']} major", fg="red"))
+            if counts.get("minor", 0):
+                parts.append(click.style(f"{counts['minor']} minor", fg="yellow"))
+            if counts.get("nitpick", 0):
+                parts.append(f"{counts['nitpick']} nitpick")
+            if parts:
+                click.echo(f"  Issues: {', '.join(parts)}")
+            else:
+                click.secho("  No issues found!", fg="green")
+
+            # Category scores
+            cat_scores = result["category_scores"]
+            cats = [
+                ("temporal", "时序"),
+                ("visual", "视觉"),
+                ("character", "角色"),
+                ("audio", "音频"),
+                ("composition", "构图"),
+                ("coherence", "连贯"),
+            ]
+            score_parts = []
+            for key, label in cats:
+                s = cat_scores.get(key)
+                if s is None:
+                    score_parts.append(f"{label}:N/A")
+                else:
+                    score_parts.append(f"{label}:{s}")
+            click.echo(f"  Scores: {' | '.join(score_parts)}")
+
+            # Summary
+            if result["summary"]:
+                click.echo(f"  {result['summary']}")
+
+            # Issue details
+            issues = result["issues"]
+            min_severity = "nitpick" if verbose else "minor"
+            severity_rank = {"critical": 0, "major": 1, "minor": 2, "nitpick": 3}
+            min_rank = severity_rank.get(min_severity, 2)
+
+            shown = [
+                iss for iss in issues
+                if severity_rank.get(iss["severity"], 3) <= min_rank
+            ]
+            if shown:
+                click.echo(f"\n  {'Sev':<9} {'Type':<25} {'Time':<12} Description")
+                click.echo(f"  {'---':<9} {'----':<25} {'----':<12} -----------")
+                for iss in shown:
+                    sev = iss["severity"]
+                    sev_color = (
+                        "red" if sev == "critical"
+                        else "red" if sev == "major"
+                        else "yellow" if sev == "minor"
+                        else None
+                    )
+                    sev_str = click.style(f"{sev:<9}", fg=sev_color) if sev_color else f"{sev:<9}"
+                    click.echo(
+                        f"  {sev_str} {iss['type']:<25} "
+                        f"{iss['timestamp']:<12} {iss['description']}"
+                    )
+
+            if store is not None:
+                store.save_critique(os.path.abspath(video_path), result)
+
+        if store is not None:
+            store.close()
+
     except Exception as e:
         _handle_error(e)
 
-    success = _apply_overlay_to_clip(
-        video,
-        video,
-        0.0,
-        duration,
-        replace=False,
-    )
-    if success:
-        overlay_path = _overlay_output_path(video)
-        if output != overlay_path and os.path.isfile(overlay_path):
-            os.replace(overlay_path, output)
-        click.secho(f"Saved: {output}", fg="green")
-        _open_file(output)
-    else:
-        raise SystemExit(1)
+
+# -----------------------------------------------------------------------
+# score
+# -----------------------------------------------------------------------
+
+
+@cli.command()
+@click.argument(
+    "path", type=click.Path(exists=True, file_okay=True, dir_okay=True)
+)
+@click.option(
+    "--no-similarity",
+    is_flag=True,
+    default=False,
+    help="Skip similarity check against indexed assets.",
+)
+@click.option("--verbose", is_flag=True, help="Show full scoring details.")
+def score(path, no_similarity, verbose):
+    """Score video files for quality across multiple dimensions.
+
+    Evaluates character/scene consistency, AI artifact detection, and
+    similarity to existing indexed assets.
+    """
+    from .chunker import SUPPORTED_VIDEO_EXTENSIONS, is_supported_video_file, scan_directory
+    from .embedder import reset_embedder
+    from .scorer import VideoScorer
+    from .store import SentryStore, detect_index
+
+    try:
+        scorer = VideoScorer()
+
+        store = None
+        if not no_similarity:
+            backend, _ = detect_index()
+            if backend is not None:
+                store = SentryStore()
+
+        if os.path.isfile(path):
+            videos = [os.path.abspath(path)]
+        else:
+            videos = scan_directory(path)
+
+        if not videos:
+            supported = ", ".join(SUPPORTED_VIDEO_EXTENSIONS)
+            click.echo(f"No supported video files found ({supported}).")
+            return
+
+        for i, video_path in enumerate(videos, 1):
+            basename = os.path.basename(video_path)
+            click.echo(f"\nScoring ({i}/{len(videos)}): {basename}")
+
+            result = scorer.score_video(video_path, store=store)
+
+            con = result["consistency"]
+            ai = result["ai_detection"]
+            sim = result["similarity"]
+
+            click.echo(f"  Overall:     {result['overall_score']:.1f}/100")
+            click.echo(
+                f"  Consistency: character {con['character']}, "
+                f"scene {con['scene']} (avg {con['average']})"
+            )
+            click.echo(
+                f"  AI score:    {ai['score']}/100 "
+                f"({'low AI feel' if ai['score'] < 40 else 'moderate' if ai['score'] < 70 else 'high AI feel'})"
+            )
+
+            if sim["similar_to"]:
+                click.echo(
+                    f"  Similarity:  {sim['max_similarity']:.2%} "
+                    f"to {os.path.basename(sim['similar_to'])}"
+                )
+            else:
+                click.echo("  Similarity:  no indexed assets to compare")
+
+            if verbose:
+                if con["notes"]:
+                    click.echo(f"  Notes:       {con['notes']}")
+                if ai["artifacts"]:
+                    click.echo(f"  Artifacts:   {', '.join(ai['artifacts'])}")
+                if ai["notes"]:
+                    click.echo(f"  AI notes:    {ai['notes']}")
+
+            if store is not None:
+                store.save_score(os.path.abspath(video_path), result)
+
+        if store is not None:
+            store.close()
+
+    except Exception as e:
+        _handle_error(e)
+    finally:
+        reset_embedder()
 
 
 # -----------------------------------------------------------------------
@@ -580,9 +684,9 @@ def stats():
         store.close()
         return
 
-    click.echo(f"Total chunks:  {s['total_chunks']}")
-    click.echo(f"Source files:  {s['unique_source_files']}")
-    click.echo(f"Backend:       gemini")
+    click.echo(f"Total embeddings:  {s['total_chunks']}")
+    click.echo(f"Source files:      {s['unique_source_files']}")
+    click.echo(f"Backend:           gemini")
     click.echo("\nIndexed files:")
     for f in s["source_files"]:
         click.echo(f"  {f}")
@@ -617,7 +721,7 @@ def reset():
         store.remove_file(f)
 
     click.echo(
-        f"Removed {s['total_chunks']} chunks from {s['unique_source_files']} files."
+        f"Removed {s['total_chunks']} embeddings from {s['unique_source_files']} files."
     )
     store.close()
 
@@ -657,9 +761,9 @@ def remove(files):
             continue
         for source_file in matches:
             removed = store.remove_file(source_file)
-            click.echo(f"Removed {removed} chunks from {source_file}")
+            click.echo(f"Removed {removed} embeddings from {source_file}")
             total_removed += removed
 
     if total_removed:
-        click.echo(f"\nTotal: removed {total_removed} chunks.")
+        click.echo(f"\nTotal: removed {total_removed} embeddings.")
     store.close()
