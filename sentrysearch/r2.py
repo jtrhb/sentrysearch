@@ -5,6 +5,7 @@ import tempfile
 from pathlib import Path
 
 import boto3
+from botocore.exceptions import ClientError
 
 
 class R2Client:
@@ -65,3 +66,37 @@ class R2Client:
             for obj in page.get("Contents", []):
                 keys.append(obj["Key"])
         return keys
+
+    def head_object(self, key: str) -> dict:
+        """Return metadata for an object (ETag, ContentLength, ContentType, LastModified)."""
+        resp = self._client.head_object(Bucket=self._bucket, Key=key)
+        return {
+            "ETag": resp["ETag"].strip('"'),
+            "ContentLength": resp["ContentLength"],
+            "ContentType": resp["ContentType"],
+            "LastModified": resp["LastModified"],
+        }
+
+    def get_etag(self, key: str) -> str:
+        """Return the ETag for an object, stripped of quotes."""
+        return self.head_object(key)["ETag"]
+
+    def move_object(self, src_key: str, dst_key: str) -> str:
+        """Copy an object to a new key, then delete the original. Returns dst_key."""
+        self._client.copy_object(
+            Bucket=self._bucket,
+            CopySource={"Bucket": self._bucket, "Key": src_key},
+            Key=dst_key,
+        )
+        self._client.delete_object(Bucket=self._bucket, Key=src_key)
+        return dst_key
+
+    def object_exists(self, key: str) -> bool:
+        """Check whether an object exists in the bucket."""
+        try:
+            self.head_object(key)
+            return True
+        except ClientError as exc:
+            if exc.response["Error"]["Code"] == "404":
+                return False
+            raise

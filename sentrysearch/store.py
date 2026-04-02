@@ -80,28 +80,33 @@ class SentryStore:
                 ON chunks (source_file)
             """)
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS video_critiques (
-                    source_file TEXT PRIMARY KEY,
-                    issues JSONB NOT NULL DEFAULT '[]',
-                    category_scores JSONB NOT NULL DEFAULT '{}',
-                    severity_counts JSONB NOT NULL DEFAULT '{}',
-                    quality_grade TEXT,
-                    grade_score DOUBLE PRECISION,
-                    summary TEXT,
-                    critiqued_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                CREATE TABLE IF NOT EXISTS assets (
+                    asset_id TEXT PRIMARY KEY,
+                    current_path TEXT NOT NULL,
+                    original_path TEXT NOT NULL,
+                    filename TEXT,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS video_scores (
-                    source_file TEXT PRIMARY KEY,
+                CREATE TABLE IF NOT EXISTS evaluations (
+                    asset_id TEXT PRIMARY KEY,
                     character_consistency DOUBLE PRECISION,
                     scene_consistency DOUBLE PRECISION,
                     ai_score DOUBLE PRECISION,
                     max_similarity DOUBLE PRECISION,
                     similar_to TEXT,
+                    category_scores JSONB NOT NULL DEFAULT '{}',
+                    issues JSONB NOT NULL DEFAULT '[]',
+                    severity_counts JSONB NOT NULL DEFAULT '{}',
+                    quality_grade TEXT,
+                    grade_score DOUBLE PRECISION,
                     overall_score DOUBLE PRECISION,
+                    summary TEXT,
                     details JSONB NOT NULL DEFAULT '{}',
-                    scored_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    evaluated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
         self._conn.commit()
@@ -257,53 +262,188 @@ class SentryStore:
         }
 
     # ------------------------------------------------------------------
-    # Video critiques
+    # Assets
     # ------------------------------------------------------------------
 
-    def save_critique(self, source_file: str, critique: dict) -> None:
-        """Save or update a video critique."""
+    def register_asset(
+        self,
+        asset_id: str,
+        current_path: str,
+        original_path: str | None = None,
+        filename: str | None = None,
+    ) -> None:
+        """Insert or update an asset record."""
+        now = datetime.now(timezone.utc)
+        if original_path is None:
+            original_path = current_path
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO assets
+                    (asset_id, current_path, original_path, filename,
+                     status, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, 'active', %s, %s)
+                ON CONFLICT (asset_id) DO UPDATE SET
+                    current_path = EXCLUDED.current_path,
+                    original_path = EXCLUDED.original_path,
+                    filename = EXCLUDED.filename,
+                    status = 'active',
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (asset_id, current_path, original_path, filename, now, now),
+            )
+        self._conn.commit()
+
+    def update_asset_path(self, asset_id: str, new_path: str) -> None:
+        """Update the current_path and updated_at for an asset."""
+        now = datetime.now(timezone.utc)
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "UPDATE assets SET current_path = %s, updated_at = %s "
+                "WHERE asset_id = %s",
+                (new_path, now, asset_id),
+            )
+        self._conn.commit()
+
+    def get_asset(self, asset_id: str) -> dict | None:
+        """Get an asset by its ID. Returns dict or None."""
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """SELECT asset_id, current_path, original_path, filename,
+                          status, created_at, updated_at
+                   FROM assets WHERE asset_id = %s""",
+                (asset_id,),
+            )
+            row = cur.fetchone()
+        if row is None:
+            return None
+        return {
+            "asset_id": row[0],
+            "current_path": row[1],
+            "original_path": row[2],
+            "filename": row[3],
+            "status": row[4],
+            "created_at": row[5],
+            "updated_at": row[6],
+        }
+
+    def get_asset_by_path(self, path: str) -> dict | None:
+        """Get an asset by its current_path. Returns dict or None."""
+        with self._conn.cursor() as cur:
+            cur.execute(
+                """SELECT asset_id, current_path, original_path, filename,
+                          status, created_at, updated_at
+                   FROM assets WHERE current_path = %s""",
+                (path,),
+            )
+            row = cur.fetchone()
+        if row is None:
+            return None
+        return {
+            "asset_id": row[0],
+            "current_path": row[1],
+            "original_path": row[2],
+            "filename": row[3],
+            "status": row[4],
+            "created_at": row[5],
+            "updated_at": row[6],
+        }
+
+    def reconcile_asset(self, asset_id: str, new_path: str) -> bool:
+        """If asset exists, update its path and set status to 'active'.
+
+        Returns True if the asset was found and updated, False otherwise.
+        """
+        now = datetime.now(timezone.utc)
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "UPDATE assets SET current_path = %s, status = 'active', "
+                "updated_at = %s WHERE asset_id = %s",
+                (new_path, now, asset_id),
+            )
+            updated = cur.rowcount > 0
+        self._conn.commit()
+        return updated
+
+    def mark_asset_stale(self, path: str) -> None:
+        """Mark an asset as stale by its current_path."""
+        now = datetime.now(timezone.utc)
+        with self._conn.cursor() as cur:
+            cur.execute(
+                "UPDATE assets SET status = 'stale', updated_at = %s "
+                "WHERE current_path = %s",
+                (now, path),
+            )
+        self._conn.commit()
+
+    # ------------------------------------------------------------------
+    # Evaluations
+    # ------------------------------------------------------------------
+
+    def save_evaluation(self, asset_id: str, evaluation: dict) -> None:
+        """Upsert an evaluation record (combines old scores + critique)."""
         import json
 
         now = datetime.now(timezone.utc)
         with self._conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO video_critiques
-                    (source_file, issues, category_scores, severity_counts,
-                     quality_grade, grade_score, summary, critiqued_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (source_file) DO UPDATE SET
-                    issues = EXCLUDED.issues,
+                INSERT INTO evaluations
+                    (asset_id, character_consistency, scene_consistency,
+                     ai_score, max_similarity, similar_to,
+                     category_scores, issues, severity_counts,
+                     quality_grade, grade_score, overall_score,
+                     summary, details, evaluated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (asset_id) DO UPDATE SET
+                    character_consistency = EXCLUDED.character_consistency,
+                    scene_consistency = EXCLUDED.scene_consistency,
+                    ai_score = EXCLUDED.ai_score,
+                    max_similarity = EXCLUDED.max_similarity,
+                    similar_to = EXCLUDED.similar_to,
                     category_scores = EXCLUDED.category_scores,
+                    issues = EXCLUDED.issues,
                     severity_counts = EXCLUDED.severity_counts,
                     quality_grade = EXCLUDED.quality_grade,
                     grade_score = EXCLUDED.grade_score,
+                    overall_score = EXCLUDED.overall_score,
                     summary = EXCLUDED.summary,
-                    critiqued_at = EXCLUDED.critiqued_at
+                    details = EXCLUDED.details,
+                    evaluated_at = EXCLUDED.evaluated_at
                 """,
                 (
-                    source_file,
-                    json.dumps(critique.get("issues", [])),
-                    json.dumps(critique.get("category_scores", {})),
-                    json.dumps(critique.get("severity_counts", {})),
-                    critique.get("quality_grade"),
-                    critique.get("grade_score"),
-                    critique.get("summary"),
+                    asset_id,
+                    evaluation.get("character_consistency"),
+                    evaluation.get("scene_consistency"),
+                    evaluation.get("ai_score"),
+                    evaluation.get("max_similarity"),
+                    evaluation.get("similar_to"),
+                    json.dumps(evaluation.get("category_scores", {})),
+                    json.dumps(evaluation.get("issues", [])),
+                    json.dumps(evaluation.get("severity_counts", {})),
+                    evaluation.get("quality_grade"),
+                    evaluation.get("grade_score"),
+                    evaluation.get("overall_score"),
+                    evaluation.get("summary"),
+                    json.dumps(evaluation.get("details", {})),
                     now,
                 ),
             )
         self._conn.commit()
 
-    def get_critique(self, source_file: str) -> dict | None:
-        """Get critique for a specific video."""
+    def get_evaluation(self, asset_id: str) -> dict | None:
+        """Get evaluation for a specific asset. Returns dict or None."""
         import json
 
         with self._conn.cursor() as cur:
             cur.execute(
-                """SELECT issues, category_scores, severity_counts,
-                          quality_grade, grade_score, summary
-                   FROM video_critiques WHERE source_file = %s""",
-                (source_file,),
+                """SELECT asset_id, character_consistency, scene_consistency,
+                          ai_score, max_similarity, similar_to,
+                          category_scores, issues, severity_counts,
+                          quality_grade, grade_score, overall_score,
+                          summary, details, evaluated_at
+                   FROM evaluations WHERE asset_id = %s""",
+                (asset_id,),
             )
             row = cur.fetchone()
         if row is None:
@@ -313,43 +453,59 @@ class SentryStore:
             return json.loads(val) if isinstance(val, str) else val
 
         return {
-            "source_file": source_file,
-            "issues": _parse(row[0]),
-            "category_scores": _parse(row[1]),
-            "severity_counts": _parse(row[2]),
-            "quality_grade": row[3],
-            "grade_score": row[4],
-            "summary": row[5],
+            "asset_id": row[0],
+            "character_consistency": row[1],
+            "scene_consistency": row[2],
+            "ai_score": row[3],
+            "max_similarity": row[4],
+            "similar_to": row[5],
+            "category_scores": _parse(row[6]),
+            "issues": _parse(row[7]),
+            "severity_counts": _parse(row[8]),
+            "quality_grade": row[9],
+            "grade_score": row[10],
+            "overall_score": row[11],
+            "summary": row[12],
+            "details": _parse(row[13]),
+            "evaluated_at": row[14],
         }
 
-    def get_critiques(
+    def get_evaluations(
         self,
+        min_overall: float | None = None,
+        max_ai_score: float | None = None,
         max_grade: str | None = None,
-        min_issues: int | None = None,
         limit: int = 50,
     ) -> list[dict]:
-        """Query video critiques with optional filters."""
+        """Query evaluations with optional filters."""
         import json
 
-        grade_order = {"F": 0, "D": 1, "C": 2, "B": 3, "A": 4}
-        conditions = []
-        params = []
+        conditions: list[str] = []
+        params: list = []
 
+        if min_overall is not None:
+            conditions.append("overall_score >= %s")
+            params.append(min_overall)
+        if max_ai_score is not None:
+            conditions.append("ai_score <= %s")
+            params.append(max_ai_score)
         if max_grade is not None:
             conditions.append("grade_score <= %s")
-            # Map grade letter to score threshold
             thresholds = {"A": 100, "B": 89, "C": 74, "D": 59, "F": 39}
             params.append(thresholds.get(max_grade.upper(), 100))
 
-        params.append(limit)
         where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        params.append(limit)
 
         with self._conn.cursor() as cur:
             cur.execute(
-                f"""SELECT source_file, issues, category_scores,
-                           severity_counts, quality_grade, grade_score, summary
-                    FROM video_critiques {where}
-                    ORDER BY grade_score ASC
+                f"""SELECT asset_id, character_consistency, scene_consistency,
+                           ai_score, max_similarity, similar_to,
+                           category_scores, issues, severity_counts,
+                           quality_grade, grade_score, overall_score,
+                           summary, details, evaluated_at
+                    FROM evaluations {where}
+                    ORDER BY overall_score DESC
                     LIMIT %s""",
                 params,
             )
@@ -358,127 +514,26 @@ class SentryStore:
         def _parse(val):
             return json.loads(val) if isinstance(val, str) else val
 
-        results = []
-        for row in rows:
-            entry = {
-                "source_file": row[0],
-                "issues": _parse(row[1]),
-                "category_scores": _parse(row[2]),
-                "severity_counts": _parse(row[3]),
-                "quality_grade": row[4],
-                "grade_score": row[5],
-                "summary": row[6],
+        return [
+            {
+                "asset_id": row[0],
+                "character_consistency": row[1],
+                "scene_consistency": row[2],
+                "ai_score": row[3],
+                "max_similarity": row[4],
+                "similar_to": row[5],
+                "category_scores": _parse(row[6]),
+                "issues": _parse(row[7]),
+                "severity_counts": _parse(row[8]),
+                "quality_grade": row[9],
+                "grade_score": row[10],
+                "overall_score": row[11],
+                "summary": row[12],
+                "details": _parse(row[13]),
+                "evaluated_at": row[14],
             }
-            if min_issues is not None:
-                if len(entry["issues"]) < min_issues:
-                    continue
-            results.append(entry)
-        return results
-
-    # ------------------------------------------------------------------
-    # Video scores
-    # ------------------------------------------------------------------
-
-    def save_score(self, source_file: str, scores: dict) -> None:
-        """Save or update video scores."""
-        import json
-
-        now = datetime.now(timezone.utc)
-        consistency = scores.get("consistency", {})
-        ai = scores.get("ai_detection", {})
-        similarity = scores.get("similarity", {})
-
-        with self._conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO video_scores
-                    (source_file, character_consistency, scene_consistency,
-                     ai_score, max_similarity, similar_to, overall_score,
-                     details, scored_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (source_file) DO UPDATE SET
-                    character_consistency = EXCLUDED.character_consistency,
-                    scene_consistency = EXCLUDED.scene_consistency,
-                    ai_score = EXCLUDED.ai_score,
-                    max_similarity = EXCLUDED.max_similarity,
-                    similar_to = EXCLUDED.similar_to,
-                    overall_score = EXCLUDED.overall_score,
-                    details = EXCLUDED.details,
-                    scored_at = EXCLUDED.scored_at
-                """,
-                (
-                    source_file,
-                    consistency.get("character"),
-                    consistency.get("scene"),
-                    ai.get("score"),
-                    similarity.get("max_similarity"),
-                    similarity.get("similar_to"),
-                    scores.get("overall_score"),
-                    json.dumps(scores),
-                    now,
-                ),
-            )
-        self._conn.commit()
-
-    def get_score(self, source_file: str) -> dict | None:
-        """Get scores for a specific video."""
-        import json
-
-        with self._conn.cursor() as cur:
-            cur.execute(
-                "SELECT details FROM video_scores WHERE source_file = %s",
-                (source_file,),
-            )
-            row = cur.fetchone()
-        if row is None:
-            return None
-        details = row[0]
-        if isinstance(details, str):
-            details = json.loads(details)
-        details["source_file"] = source_file
-        return details
-
-    def get_scores(
-        self,
-        min_overall: float | None = None,
-        max_ai_score: float | None = None,
-        limit: int = 50,
-    ) -> list[dict]:
-        """Query video scores with optional filters."""
-        import json
-
-        conditions = []
-        params = []
-
-        if min_overall is not None:
-            conditions.append("overall_score >= %s")
-            params.append(min_overall)
-        if max_ai_score is not None:
-            conditions.append("ai_score <= %s")
-            params.append(max_ai_score)
-
-        where = ""
-        if conditions:
-            where = "WHERE " + " AND ".join(conditions)
-
-        params.append(limit)
-
-        with self._conn.cursor() as cur:
-            cur.execute(
-                f"SELECT source_file, details FROM video_scores "
-                f"{where} ORDER BY overall_score DESC LIMIT %s",
-                params,
-            )
-            rows = cur.fetchall()
-
-        results = []
-        for row in rows:
-            details = row[1]
-            if isinstance(details, str):
-                details = json.loads(details)
-            details["source_file"] = row[0]
-            results.append(details)
-        return results
+            for row in rows
+        ]
 
     def close(self):
         """Close the database connection."""

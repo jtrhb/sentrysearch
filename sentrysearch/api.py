@@ -9,12 +9,11 @@ from pydantic import BaseModel
 
 load_dotenv()
 
-# Maximum video duration (seconds) Gemini Embedding 2 accepts in a single request.
 MAX_SINGLE_EMBED_DURATION = 120
 
 app = FastAPI(
     title="SentrySearch",
-    description="Semantic search over video footage via natural language queries.",
+    description="Semantic search, evaluation, and asset management for AI-generated video.",
 )
 
 
@@ -28,7 +27,6 @@ class IndexRequest(BaseModel):
     preprocess: bool = True
     target_resolution: int = 480
     target_fps: int = 5
-    # Chunking params — only used when a video exceeds 120s
     chunk_duration: int = 30
     overlap: int = 5
 
@@ -47,10 +45,12 @@ class SearchRequest(BaseModel):
 
 
 class SearchResult(BaseModel):
+    asset_id: str | None = None
     source_file: str
     start_time: float
     end_time: float
     similarity_score: float
+    current_path: str | None = None
     video_url: str | None = None
 
 
@@ -58,54 +58,35 @@ class SearchResponse(BaseModel):
     results: list[SearchResult]
 
 
-class StatsResponse(BaseModel):
-    total_chunks: int
-    unique_source_files: int
-    source_files: list[str]
-
-
-class ScoreRequest(BaseModel):
+class EvaluateRequest(BaseModel):
     r2_keys: list[str]
     check_similarity: bool = True
     weights: dict | None = None
 
 
-class VideoScoreResult(BaseModel):
-    source_file: str
-    consistency: dict
-    ai_detection: dict
-    similarity: dict
-    overall_score: float
+class EvaluateResponse(BaseModel):
+    evaluations: list[dict]
 
 
-class ScoreResponse(BaseModel):
-    scores: list[VideoScoreResult]
+class ReconcileRequest(BaseModel):
+    asset_id: str
+    new_path: str
 
 
-class CritiqueRequest(BaseModel):
-    r2_keys: list[str]
+class ReconcileResponse(BaseModel):
+    found: bool
+    asset_id: str
+    new_path: str
 
 
-class CritiqueIssue(BaseModel):
-    category: str
-    type: str
-    severity: str
-    description: str
-    timestamp: str
+class StaleRequest(BaseModel):
+    path: str
 
 
-class CritiqueResult(BaseModel):
-    source_file: str
-    issues: list[CritiqueIssue]
-    category_scores: dict
-    severity_counts: dict
-    quality_grade: str
-    grade_score: float
-    summary: str
-
-
-class CritiqueResponse(BaseModel):
-    critiques: list[CritiqueResult]
+class StatsResponse(BaseModel):
+    total_chunks: int
+    unique_source_files: int
+    source_files: list[str]
 
 
 class RemoveRequest(BaseModel):
@@ -123,18 +104,16 @@ class RemoveResponse(BaseModel):
 
 def _get_store():
     from .store import SentryStore
-
     return SentryStore()
 
 
 def _get_r2():
     from .r2 import R2Client
-
     return R2Client()
 
 
 # ---------------------------------------------------------------------------
-# Endpoints
+# Health / Stats
 # ---------------------------------------------------------------------------
 
 
@@ -152,12 +131,17 @@ def stats():
         store.close()
 
 
+# ---------------------------------------------------------------------------
+# Index — with asset registration (ETag as asset_id)
+# ---------------------------------------------------------------------------
+
+
 @app.post("/index", response_model=IndexResponse)
 def index_videos(request: IndexRequest):
     """Index video files from R2.
 
-    Videos ≤120s are embedded as a whole.  Longer videos are automatically
-    split into overlapping chunks before embedding.
+    Creates an asset record (keyed by R2 ETag) and embeds the video.
+    Videos ≤120s are embedded whole; longer ones are auto-chunked.
     """
     from .chunker import (
         _get_video_duration,
@@ -176,8 +160,21 @@ def index_videos(request: IndexRequest):
         new_chunks = 0
 
         for r2_key in request.r2_keys:
-            if store.is_indexed(r2_key):
+            # Get ETag as asset_id
+            etag = r2.get_etag(r2_key)
+
+            # Skip if already indexed
+            if store.is_indexed(etag):
                 continue
+
+            # Register asset
+            filename = os.path.basename(r2_key)
+            store.register_asset(
+                asset_id=etag,
+                current_path=r2_key,
+                original_path=r2_key,
+                filename=filename,
+            )
 
             local_path = r2.download_temp(r2_key)
             tmp_dir = None
@@ -186,7 +183,6 @@ def index_videos(request: IndexRequest):
                 duration = _get_video_duration(local_path)
 
                 if duration <= MAX_SINGLE_EMBED_DURATION:
-                    # --- Whole-video embedding ---
                     embed_path = local_path
                     if request.preprocess:
                         embed_path = preprocess_chunk(
@@ -196,17 +192,12 @@ def index_videos(request: IndexRequest):
                         )
 
                     embedding = embedder.embed_video_chunk(embed_path)
-
-                    store.add_chunks(
-                        [
-                            {
-                                "source_file": r2_key,
-                                "start_time": 0.0,
-                                "end_time": duration,
-                                "embedding": embedding,
-                            }
-                        ]
-                    )
+                    store.add_chunks([{
+                        "source_file": etag,
+                        "start_time": 0.0,
+                        "end_time": duration,
+                        "embedding": embedding,
+                    }])
                     new_videos += 1
                     new_chunks += 1
 
@@ -215,9 +206,7 @@ def index_videos(request: IndexRequest):
                             os.unlink(embed_path)
                         except OSError:
                             pass
-
                 else:
-                    # --- Chunked embedding for long videos ---
                     chunks = chunk_video(
                         local_path,
                         chunk_duration=request.chunk_duration,
@@ -245,14 +234,12 @@ def index_videos(request: IndexRequest):
                                 files_to_cleanup.append(embed_path)
 
                         embedding = embedder.embed_video_chunk(embed_path)
-                        embedded.append(
-                            {
-                                "source_file": r2_key,
-                                "start_time": chunk["start_time"],
-                                "end_time": chunk["end_time"],
-                                "embedding": embedding,
-                            }
-                        )
+                        embedded.append({
+                            "source_file": etag,
+                            "start_time": chunk["start_time"],
+                            "end_time": chunk["end_time"],
+                            "embedding": embedding,
+                        })
                         files_to_cleanup.append(chunk["chunk_path"])
 
                     for f in files_to_cleanup:
@@ -289,11 +276,18 @@ def index_videos(request: IndexRequest):
         store.close()
 
 
+# ---------------------------------------------------------------------------
+# Search — resolves asset_id → current_path → presigned URL
+# ---------------------------------------------------------------------------
+
+
 @app.post("/search", response_model=SearchResponse)
 def search_footage(request: SearchRequest):
     """Search indexed footage with a natural language query.
 
-    Returns matching videos with presigned R2 URLs for direct playback.
+    Returns matching videos with current R2 paths and presigned URLs.
+    The source_file in chunks is an asset_id (ETag); this endpoint
+    resolves it to the current path via the assets table.
     """
     from .embedder import get_embedder, reset_embedder
     from .search import search_footage as _search
@@ -302,13 +296,9 @@ def search_footage(request: SearchRequest):
 
     try:
         if store.get_stats()["total_chunks"] == 0:
-            raise HTTPException(
-                status_code=404,
-                detail="No indexed footage. POST /index first.",
-            )
+            raise HTTPException(status_code=404, detail="No indexed footage. POST /index first.")
 
         get_embedder("gemini")
-
         results = _search(request.query, store, n_results=request.n_results)
 
         if not results:
@@ -318,19 +308,23 @@ def search_footage(request: SearchRequest):
         output = []
 
         for r in results:
-            video_url = None
-            if r["similarity_score"] >= request.threshold:
-                video_url = r2.presigned_url(r["source_file"])
+            asset_id = r["source_file"]  # This is now an ETag
+            asset = store.get_asset(asset_id)
 
-            output.append(
-                SearchResult(
-                    source_file=r["source_file"],
-                    start_time=r["start_time"],
-                    end_time=r["end_time"],
-                    similarity_score=r["similarity_score"],
-                    video_url=video_url,
-                )
-            )
+            current_path = asset["current_path"] if asset else None
+            video_url = None
+            if current_path and r["similarity_score"] >= request.threshold:
+                video_url = r2.presigned_url(current_path)
+
+            output.append(SearchResult(
+                asset_id=asset_id,
+                source_file=current_path or asset_id,
+                start_time=r["start_time"],
+                end_time=r["end_time"],
+                similarity_score=r["similarity_score"],
+                current_path=current_path,
+                video_url=video_url,
+            ))
 
         return SearchResponse(results=output)
 
@@ -343,43 +337,50 @@ def search_footage(request: SearchRequest):
         store.close()
 
 
-@app.post("/score", response_model=ScoreResponse)
-def score_videos(request: ScoreRequest):
-    """Score video files from R2 across multiple quality dimensions.
+# ---------------------------------------------------------------------------
+# Evaluate — unified scoring + criticism
+# ---------------------------------------------------------------------------
 
-    Evaluates character/scene consistency, AI-generated artifacts, and
-    similarity to existing indexed assets.
+
+@app.post("/evaluate", response_model=EvaluateResponse)
+def evaluate_videos(request: EvaluateRequest):
+    """Run comprehensive quality evaluation on videos from R2.
+
+    Single Gemini call per video covering consistency scoring, AI detection,
+    and defect detection across 6 categories (25 defect types).
     """
     from .embedder import reset_embedder
-    from .scorer import VideoScorer
+    from .evaluator import VideoEvaluator
 
     store = _get_store() if request.check_similarity else None
     r2 = _get_r2()
-    scorer = VideoScorer()
+    evaluator = VideoEvaluator()
 
     try:
-        scores = []
+        evaluations = []
         for r2_key in request.r2_keys:
+            etag = r2.get_etag(r2_key)
             local_path = r2.download_temp(r2_key)
             try:
-                result = scorer.score_video(
+                result = evaluator.evaluate(
                     local_path,
                     store=store,
                     weights=request.weights,
                 )
+                result["asset_id"] = etag
                 result["source_file"] = r2_key
 
                 if store is not None:
-                    store.save_score(r2_key, result)
+                    store.save_evaluation(etag, result)
 
-                scores.append(result)
+                evaluations.append(result)
             finally:
                 try:
                     os.unlink(local_path)
                 except OSError:
                     pass
 
-        return ScoreResponse(scores=scores)
+        return EvaluateResponse(evaluations=evaluations)
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -389,97 +390,89 @@ def score_videos(request: ScoreRequest):
             store.close()
 
 
-@app.get("/scores")
-def get_scores(
+@app.get("/evaluations")
+def get_evaluations(
     min_overall: float | None = None,
     max_ai_score: float | None = None,
+    max_grade: str | None = None,
     limit: int = 50,
 ):
-    """Query stored video scores with optional filters."""
+    """Query stored evaluations with optional filters."""
     store = _get_store()
     try:
-        return store.get_scores(
+        return store.get_evaluations(
             min_overall=min_overall,
             max_ai_score=max_ai_score,
+            max_grade=max_grade,
             limit=limit,
         )
     finally:
         store.close()
 
 
-@app.get("/scores/{source_file:path}")
-def get_score(source_file: str):
-    """Get scores for a specific video."""
+@app.get("/evaluations/{asset_id}")
+def get_evaluation(asset_id: str):
+    """Get evaluation for a specific asset."""
     store = _get_store()
     try:
-        result = store.get_score(source_file)
+        result = store.get_evaluation(asset_id)
         if result is None:
-            raise HTTPException(status_code=404, detail="No scores found")
+            raise HTTPException(status_code=404, detail="No evaluation found")
         return result
     finally:
         store.close()
 
 
-@app.post("/critique", response_model=CritiqueResponse)
-def critique_videos(request: CritiqueRequest):
-    """Run comprehensive quality criticism on videos from R2.
+# ---------------------------------------------------------------------------
+# Assets — reconciliation for asset-tracker worker
+# ---------------------------------------------------------------------------
 
-    Identifies specific defects across temporal, visual, audio-visual,
-    compositional, and coherence dimensions with severity ratings.
+
+@app.get("/assets/{asset_id}")
+def get_asset(asset_id: str):
+    """Get asset info by asset_id (ETag)."""
+    store = _get_store()
+    try:
+        result = store.get_asset(asset_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Asset not found")
+        return result
+    finally:
+        store.close()
+
+
+@app.post("/assets/reconcile", response_model=ReconcileResponse)
+def reconcile_asset(request: ReconcileRequest):
+    """Update asset path after a file move. Called by asset-tracker worker.
+
+    Uses ETag as asset_id to match the moved file to its existing record.
     """
-    from .criticizer import VideoCritic
-
     store = _get_store()
-    r2 = _get_r2()
-    critic = VideoCritic()
-
     try:
-        critiques = []
-        for r2_key in request.r2_keys:
-            local_path = r2.download_temp(r2_key)
-            try:
-                result = critic.criticize(local_path)
-                result["source_file"] = r2_key
-                store.save_critique(r2_key, result)
-                critiques.append(result)
-            finally:
-                try:
-                    os.unlink(local_path)
-                except OSError:
-                    pass
-
-        return CritiqueResponse(critiques=critiques)
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        found = store.reconcile_asset(request.asset_id, request.new_path)
+        return ReconcileResponse(
+            found=found,
+            asset_id=request.asset_id,
+            new_path=request.new_path,
+        )
     finally:
         store.close()
 
 
-@app.get("/critiques")
-def get_critiques(
-    max_grade: str | None = None,
-    limit: int = 50,
-):
-    """Query stored video critiques. Sorted by worst quality first."""
+@app.post("/assets/stale")
+def mark_stale(request: StaleRequest):
+    """Mark an asset as stale (file deleted from R2). Called by asset-tracker."""
     store = _get_store()
     try:
-        return store.get_critiques(max_grade=max_grade, limit=limit)
+        store.mark_asset_stale(request.path)
+        return {"status": "ok", "path": request.path}
     finally:
         store.close()
 
 
-@app.get("/critiques/{source_file:path}")
-def get_critique(source_file: str):
-    """Get critique for a specific video."""
-    store = _get_store()
-    try:
-        result = store.get_critique(source_file)
-        if result is None:
-            raise HTTPException(status_code=404, detail="No critique found")
-        return result
-    finally:
-        store.close()
+# ---------------------------------------------------------------------------
+# Remove / Reset
+# ---------------------------------------------------------------------------
 
 
 @app.post("/remove", response_model=RemoveResponse)
@@ -500,12 +493,17 @@ def remove_files(request: RemoveRequest):
 
 @app.post("/reset")
 def reset_index():
-    """Delete all indexed data."""
+    """Delete all indexed data, assets, and evaluations."""
     store = _get_store()
     try:
         s = store.get_stats()
         for f in s["source_files"]:
             store.remove_file(f)
+        # Also clear assets and evaluations
+        with store._conn.cursor() as cur:
+            cur.execute("DELETE FROM evaluations")
+            cur.execute("DELETE FROM assets")
+        store._conn.commit()
         return {
             "removed_chunks": s["total_chunks"],
             "removed_files": s["unique_source_files"],
