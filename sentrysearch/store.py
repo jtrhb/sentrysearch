@@ -59,8 +59,8 @@ class SentryStore:
         """
         self._url = database_url or os.environ["DATABASE_URL"]
         self._conn = psycopg.connect(self._url)
-        register_vector(self._conn)
         self._ensure_schema()
+        register_vector(self._conn)
 
     def _ensure_schema(self):
         with self._conn.cursor() as cur:
