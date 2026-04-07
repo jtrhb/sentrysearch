@@ -201,7 +201,7 @@ class SentryStore:
                        1 - distance AS score, distance
                 FROM (
                     SELECT source_file, start_time, end_time,
-                           embedding <=> %s AS distance
+                           embedding <=> %s::vector AS distance
                     FROM chunks
                     ORDER BY distance
                     LIMIT %s
@@ -413,11 +413,11 @@ class SentryStore:
                 """,
                 (
                     asset_id,
-                    evaluation.get("character_consistency"),
-                    evaluation.get("scene_consistency"),
-                    evaluation.get("ai_score"),
-                    evaluation.get("max_similarity"),
-                    evaluation.get("similar_to"),
+                    (evaluation.get("consistency") or {}).get("character", evaluation.get("character_consistency")),
+                    (evaluation.get("consistency") or {}).get("scene", evaluation.get("scene_consistency")),
+                    (evaluation.get("ai_detection") or {}).get("score", evaluation.get("ai_score")),
+                    (evaluation.get("similarity") or {}).get("max_similarity", evaluation.get("max_similarity")),
+                    (evaluation.get("similarity") or {}).get("similar_to", evaluation.get("similar_to")),
                     json.dumps(evaluation.get("category_scores", {})),
                     json.dumps(evaluation.get("issues", [])),
                     json.dumps(evaluation.get("severity_counts", {})),
