@@ -1,7 +1,9 @@
 """FastAPI web API for SentrySearch."""
 
+import base64
 import os
 import shutil
+import tempfile
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
@@ -22,7 +24,13 @@ app = FastAPI(
 @app.middleware("http")
 async def check_api_key(request: Request, call_next):
     if API_KEY and request.url.path != "/health":
+        # Accept either header style: X-API-Key (legacy) or
+        # Authorization: Bearer <key> (OpenAI / ChatCut convention).
         key = request.headers.get("X-API-Key")
+        if not key:
+            auth = request.headers.get("Authorization", "")
+            if auth.lower().startswith("bearer "):
+                key = auth[7:].strip()
         if key != API_KEY:
             return JSONResponse(status_code=401, content={"detail": "Invalid API key"})
     return await call_next(request)
@@ -140,6 +148,168 @@ def stats():
         return store.get_stats()
     finally:
         store.close()
+
+
+# ---------------------------------------------------------------------------
+# /v1/embeddings — OpenAI-shape endpoint over gemini-embedding-2-preview.
+#
+# Used by external services (e.g. ChatCut agent) that want a unified
+# multimodal embedding service without re-implementing Gemini auth and
+# rate-limiting. Supports text inputs today; image/video data URIs are
+# accepted via the OpenAI content-block shape and routed through
+# Part.from_bytes for the same vector space.
+#
+# Request:
+#   { "model": "gemini-embedding-2", "input": str | [str] | [content_block],
+#     "dimensions": 768 }
+# Content block (multimodal):
+#   { "type": "image_url", "image_url": "data:image/png;base64,..." }
+#   { "type": "video_url", "video_url": "data:video/mp4;base64,..." }
+#   { "type": "text",      "text": "..." }
+# Response (OpenAI shape):
+#   { "object": "list",
+#     "data": [{"object": "embedding", "embedding": [...], "index": 0}, ...],
+#     "model": "gemini-embedding-2-preview" }
+# ---------------------------------------------------------------------------
+
+
+class EmbeddingsRequest(BaseModel):
+    input: str | list  # str | list[str] | list[dict]
+    model: str | None = None  # accepted but ignored — always gemini-embedding-2-preview
+    dimensions: int | None = None
+    task_type: str | None = None  # "RETRIEVAL_DOCUMENT" (default) | "RETRIEVAL_QUERY"
+
+
+def _decode_data_uri(uri: str) -> tuple[bytes, str]:
+    """Decode a `data:<mime>;base64,<payload>` URI to (bytes, mime_type)."""
+    if not uri.startswith("data:"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Expected data: URI, got {uri[:32]}...",
+        )
+    head, _, payload = uri[5:].partition(",")
+    if ";base64" not in head:
+        raise HTTPException(
+            status_code=400,
+            detail="Only base64-encoded data: URIs are supported",
+        )
+    mime = head.split(";")[0] or "application/octet-stream"
+    try:
+        data = base64.b64decode(payload)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid base64 payload: {e}")
+    return data, mime
+
+
+def _embed_one(item, dims: int, task_type: str) -> list[float]:
+    """Embed a single input item (str | content block dict) and return a vector
+    of length `dims` (MRL truncation handled by Gemini's output_dimensionality).
+    """
+    from google.genai import types
+
+    from .embedder import get_embedder
+
+    embedder = get_embedder("gemini")
+    client = embedder._client
+    limiter = embedder._limiter
+
+    # ---- Build the Gemini content parts ----
+    if isinstance(item, str):
+        contents = item
+    elif isinstance(item, dict):
+        item_type = item.get("type")
+        if item_type == "text":
+            contents = item.get("text") or ""
+        elif item_type == "image_url":
+            url = item.get("image_url")
+            if isinstance(url, dict):
+                url = url.get("url")
+            if not url:
+                raise HTTPException(status_code=400, detail="image_url missing url")
+            data, mime = _decode_data_uri(url)
+            part = (
+                types.Part.from_bytes(data=data, mime_type=mime)
+                if hasattr(types.Part, "from_bytes")
+                else types.Part(inline_data=types.Blob(data=data, mime_type=mime))
+            )
+            contents = types.Content(parts=[part])
+        elif item_type == "video_url":
+            url = item.get("video_url")
+            if isinstance(url, dict):
+                url = url.get("url")
+            if not url:
+                raise HTTPException(status_code=400, detail="video_url missing url")
+            data, mime = _decode_data_uri(url)
+            part = (
+                types.Part.from_bytes(data=data, mime_type=mime)
+                if hasattr(types.Part, "from_bytes")
+                else types.Part(inline_data=types.Blob(data=data, mime_type=mime))
+            )
+            contents = types.Content(parts=[part])
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported content block type: {item_type!r}",
+            )
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Each input must be a string or content block dict, got {type(item).__name__}",
+        )
+
+    # ---- Call Gemini ----
+    config = types.EmbedContentConfig(
+        task_type=task_type,
+        output_dimensionality=dims,
+    )
+
+    from .gemini_embedder import _retry
+
+    limiter.wait()
+    response = _retry(
+        lambda: client.models.embed_content(
+            model="gemini-embedding-2-preview",
+            contents=contents,
+            config=config,
+        )
+    )
+    return response.embeddings[0].values
+
+
+@app.post("/v1/embeddings")
+def embeddings(req: EmbeddingsRequest):
+    """OpenAI-shape multimodal embedding endpoint backed by Gemini.
+
+    Designed for clients that already speak the OpenAI /v1/embeddings
+    contract (e.g. ChatCut agent's EmbeddingClient).
+    """
+    inputs: list = req.input if isinstance(req.input, list) else [req.input]
+    if not inputs:
+        raise HTTPException(status_code=400, detail="`input` is required")
+    dims = req.dimensions or 3072
+    if dims < 1 or dims > 3072:
+        raise HTTPException(
+            status_code=400,
+            detail="dimensions must be in [1, 3072]",
+        )
+    task_type = req.task_type or "RETRIEVAL_DOCUMENT"
+
+    try:
+        vectors = [_embed_one(item, dims, task_type) for item in inputs]
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {
+        "object": "list",
+        "data": [
+            {"object": "embedding", "embedding": v, "index": i}
+            for i, v in enumerate(vectors)
+        ],
+        "model": "gemini-embedding-2-preview",
+        "usage": {"prompt_tokens": 0, "total_tokens": 0},
+    }
 
 
 # ---------------------------------------------------------------------------
